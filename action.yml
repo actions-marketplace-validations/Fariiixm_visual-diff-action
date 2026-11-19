@@ -1,0 +1,207 @@
+name: Visual Update Guard
+description: Screenshots your web app on the base branch and on the current code, compares them pixel by pixel, and reports OK, CHANGED, BROKEN or UNAVAILABLE.
+author: Visual Update Guard contributors
+
+branding:
+  icon: eye
+  color: purple
+
+inputs:
+  playwright-config:
+    description: Playwright config with the screenshot tests, relative to working-directory.
+    required: false
+    default: playwright.visual.config.ts
+  working-directory:
+    description: Folder of the web app, relative to the repository root. Useful in monorepos.
+    required: false
+    default: .
+  base-ref:
+    description: Branch, tag, commit or HEAD-relative ref whose screenshots are the reference.
+    required: false
+    default: ${{ github.base_ref || 'main' }}
+  install-command:
+    description: Installs the dependencies. Empty means it is chosen from the lockfile (npm ci, pnpm install --frozen-lockfile or yarn install).
+    required: false
+    default: ''
+  setup-command:
+    description: Runs before the build on each side, in the same shell as the build and the tests, so exported variables reach both. Use it for local databases, migrations, folders or throwaway secrets.
+    required: false
+    default: ''
+  build-command:
+    description: Builds the app. Set it to an empty string when the app needs no build.
+    required: false
+    default: npm run build --if-present
+  browsers:
+    description: Browsers to install, separated by spaces (for example "chromium"). Empty installs every browser Playwright installs by default.
+    required: false
+    default: ''
+  install-deps:
+    description: Install the system libraries the browsers need (playwright install --with-deps).
+    required: false
+    default: 'true'
+  playwright-args:
+    description: Extra arguments for "playwright test" on both sides, for example --project=chromium.
+    required: false
+    default: ''
+  node-version:
+    description: Node.js version to set up. Empty uses .nvmrc or .node-version in working-directory, or else the Node.js already on the runner.
+    required: false
+    default: ''
+  cache:
+    description: Cache the package manager store and the Playwright browsers.
+    required: false
+    default: 'true'
+  upload-report:
+    description: Upload the Playwright HTML report and the diff images as an artifact.
+    required: false
+    default: 'true'
+  artifact-name:
+    description: Name of the report artifact. It must be unique in the workflow run (add the matrix values when you use a matrix).
+    required: false
+    default: visual-update-guard-report
+  retention-days:
+    description: Days to keep the report artifact.
+    required: false
+    default: '14'
+  fail-on:
+    description: Statuses that fail the step, separated by commas (for example "CHANGED,BROKEN"). Empty means the result never fails the step.
+    required: false
+    default: ''
+  job-summary:
+    description: Write the summary to the job summary page.
+    required: false
+    default: 'true'
+
+outputs:
+  status:
+    description: OK, CHANGED, BROKEN or UNAVAILABLE.
+    value: ${{ steps.finish.outputs.status }}
+  summary:
+    description: Markdown summary, ready for a pull request comment.
+    value: ${{ steps.finish.outputs.summary }}
+  changed:
+    description: Comma-separated names of the snapshots that changed or have no reference.
+    value: ${{ steps.finish.outputs.changed }}
+  report-url:
+    description: URL of the report artifact, when it was uploaded.
+    value: ${{ steps.upload.outputs.artifact-url }}
+  base-sha:
+    description: Commit used as the reference.
+    value: ${{ steps.finish.outputs.base-sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve the Node.js version
+      id: node
+      shell: bash
+      env:
+        INPUT_NODE_VERSION: ${{ inputs.node-version }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+      run: |
+        if [ -n "$INPUT_NODE_VERSION" ]; then
+          echo "version=$INPUT_NODE_VERSION" >> "$GITHUB_OUTPUT"
+        elif [ -f "$GITHUB_WORKSPACE/$INPUT_WORKING_DIRECTORY/.nvmrc" ]; then
+          echo "file=$INPUT_WORKING_DIRECTORY/.nvmrc" >> "$GITHUB_OUTPUT"
+        elif [ -f "$GITHUB_WORKSPACE/$INPUT_WORKING_DIRECTORY/.node-version" ]; then
+          echo "file=$INPUT_WORKING_DIRECTORY/.node-version" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set up Node.js
+      if: steps.node.outputs.version != '' || steps.node.outputs.file != ''
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ steps.node.outputs.version }}
+        node-version-file: ${{ steps.node.outputs.file }}
+        package-manager-cache: false
+
+    - name: Prepare
+      id: prepare
+      shell: bash
+      env:
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_PLAYWRIGHT_CONFIG: ${{ inputs.playwright-config }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/prepare.sh"
+
+    - name: Cache dependencies
+      if: inputs.cache == 'true' && steps.prepare.outputs.cache-dir != ''
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.prepare.outputs.cache-dir }}
+        key: visual-update-guard-${{ runner.os }}-${{ steps.prepare.outputs.pm }}-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/pnpm-lock.yaml', '**/yarn.lock', '!**/node_modules/**') }}
+        restore-keys: visual-update-guard-${{ runner.os }}-${{ steps.prepare.outputs.pm }}-
+
+    - name: Cache Playwright browsers
+      if: inputs.cache == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/ms-playwright
+          ~/Library/Caches/ms-playwright
+        key: visual-update-guard-${{ runner.os }}-playwright-${{ steps.prepare.outputs.playwright-version || hashFiles('**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '!**/node_modules/**') }}
+        restore-keys: visual-update-guard-${{ runner.os }}-playwright-
+
+    - name: Screenshot base-ref
+      id: before
+      shell: bash
+      env:
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        INPUT_PLAYWRIGHT_CONFIG: ${{ inputs.playwright-config }}
+        INPUT_INSTALL_COMMAND: ${{ inputs.install-command }}
+        INPUT_SETUP_COMMAND: ${{ inputs.setup-command }}
+        INPUT_BUILD_COMMAND: ${{ inputs.build-command }}
+        INPUT_BROWSERS: ${{ inputs.browsers }}
+        INPUT_INSTALL_DEPS: ${{ inputs.install-deps }}
+        INPUT_PLAYWRIGHT_ARGS: ${{ inputs.playwright-args }}
+        VUG_TMP: ${{ steps.prepare.outputs.tmp }}
+        VUG_REPO_ROOT: ${{ steps.prepare.outputs.repo-root }}
+        VUG_PREFIX: ${{ steps.prepare.outputs.prefix }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/before.sh"
+
+    - name: Compare the current code
+      id: after
+      shell: bash
+      env:
+        INPUT_PLAYWRIGHT_CONFIG: ${{ inputs.playwright-config }}
+        INPUT_INSTALL_COMMAND: ${{ inputs.install-command }}
+        INPUT_SETUP_COMMAND: ${{ inputs.setup-command }}
+        INPUT_BUILD_COMMAND: ${{ inputs.build-command }}
+        INPUT_BROWSERS: ${{ inputs.browsers }}
+        INPUT_INSTALL_DEPS: ${{ inputs.install-deps }}
+        INPUT_PLAYWRIGHT_ARGS: ${{ inputs.playwright-args }}
+        VUG_TMP: ${{ steps.prepare.outputs.tmp }}
+        VUG_REPO_ROOT: ${{ steps.prepare.outputs.repo-root }}
+        VUG_HEAD_ROOT: ${{ steps.prepare.outputs.head-root }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/after.sh"
+
+    - name: Upload the Playwright report
+      id: upload
+      if: always() && inputs.upload-report == 'true' && steps.prepare.outputs.tmp != ''
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ steps.prepare.outputs.tmp }}/report
+          ${{ steps.prepare.outputs.tmp }}/after-output
+        if-no-files-found: ignore
+        retention-days: ${{ inputs.retention-days }}
+
+    - name: Summary
+      id: finish
+      if: always()
+      shell: bash
+      env:
+        INPUT_BASE_REF: ${{ inputs.base-ref }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_JOB_SUMMARY: ${{ inputs.job-summary }}
+        ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        VUG_TMP: ${{ steps.prepare.outputs.tmp }}
+      run: node "$GITHUB_ACTION_PATH/scripts/report.mjs"
+
+    - name: Clean up
+      if: always()
+      shell: bash
+      env:
+        VUG_TMP: ${{ steps.prepare.outputs.tmp }}
+        VUG_REPO_ROOT: ${{ steps.prepare.outputs.repo-root }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/cleanup.sh"
