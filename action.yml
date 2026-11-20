@@ -1,5 +1,5 @@
 name: Visual Update Guard
-description: Screenshots your web app on the base branch and on the current code, compares them pixel by pixel, and reports OK, CHANGED, BROKEN or UNAVAILABLE.
+description: Visual regression testing with Playwright snapshots
 author: Visual Update Guard contributors
 
 branding:
